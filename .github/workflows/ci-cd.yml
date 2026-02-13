@@ -1,0 +1,242 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  NODE_VERSION: '20'
+  DEPLOY_PATH: '/var/www/webodoctor'
+
+jobs:
+  # Job 1: Testing and Security Checks
+  test-and-security:
+    name: Testing & Security Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint (Linting)
+        run: npm run lint
+        continue-on-error: false
+
+      - name: Run TypeScript Type Check
+        run: npx tsc --noEmit
+        continue-on-error: false
+
+      # Dependency vulnerability check using npm audit
+      - name: Check for vulnerabilities (npm audit)
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+      # SAST - Static Application Security Testing using Semgrep
+      - name: SAST - Semgrep Security Scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/react
+            p/typescript
+        continue-on-error: true
+
+      # Additional vulnerability scanning with Snyk
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      # OWASP Dependency Check
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        continue-on-error: true
+        with:
+          project: 'webodoctor'
+          path: '.'
+          format: 'HTML'
+          
+      - name: Upload OWASP Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-dependency-check-report
+          path: reports
+
+  # Job 2: Build
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: test-and-security
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Create build archive
+        run: |
+          cd dist
+          tar -czf ../dist-${{ github.sha }}.tar.gz .
+          cd ..
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-build
+          path: dist-${{ github.sha }}.tar.gz
+          retention-days: 30
+
+  # Job 3: Deploy to Server
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Manage old builds and deploy new build
+        run: |
+          # Define variables
+          SERVER_USER="${{ secrets.SERVER_USER }}"
+          SERVER_HOST="${{ secrets.SERVER_HOST }}"
+          DEPLOY_PATH="${{ env.DEPLOY_PATH }}"
+          BUILD_FILE="dist-${{ github.sha }}.tar.gz"
+          
+          # SSH into server and manage builds
+          ssh ${SERVER_USER}@${SERVER_HOST} << 'ENDSSH'
+            set -e
+            
+            # Navigate to deployment directory
+            cd ${{ env.DEPLOY_PATH }}
+            
+            # Check if old build exists and delete it
+            if [ -d "dist-old" ]; then
+              echo "Deleting old build (dist-old)..."
+              rm -rf dist-old
+            fi
+            
+            # Check if current build exists and rename it to old
+            if [ -d "dist" ]; then
+              echo "Renaming current build (dist) to old (dist-old)..."
+              mv dist dist-old
+            fi
+            
+            # Create new dist directory
+            mkdir -p dist
+            
+            echo "Build management completed. Ready for new deployment."
+          ENDSSH
+
+      - name: Copy new build to server
+        run: |
+          scp dist-${{ github.sha }}.tar.gz ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ env.DEPLOY_PATH }}/
+
+      - name: Extract and finalize deployment
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            set -e
+            
+            cd ${{ env.DEPLOY_PATH }}
+            
+            # Extract new build
+            echo "Extracting new build..."
+            tar -xzf dist-${{ github.sha }}.tar.gz -C dist/
+            
+            # Remove the archive
+            rm dist-${{ github.sha }}.tar.gz
+            
+            # Set proper permissions
+            chmod -R 755 dist
+            
+            # Reload Nginx (optional, usually not needed for static files)
+            # sudo systemctl reload nginx
+            
+            echo "Deployment completed successfully!"
+            echo "Current build is in: dist/"
+            echo "Previous build backup is in: dist-old/"
+          ENDSSH
+
+      - name: Verify deployment
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            cd ${{ env.DEPLOY_PATH }}
+            echo "=== Deployment Directory Structure ==="
+            ls -lah
+            echo ""
+            echo "=== Dist Directory Contents ==="
+            ls -lah dist/
+          ENDSSH
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ENDSSH'
+            cd ${{ env.DEPLOY_PATH }}
+            
+            # If deployment failed and we have an old build, restore it
+            if [ -d "dist-old" ] && [ ! "$(ls -A dist)" ]; then
+              echo "Deployment failed. Restoring previous build..."
+              rm -rf dist
+              mv dist-old dist
+              echo "Previous build restored."
+            fi
+          ENDSSH
+
+  # Job 4: Notification (Optional)
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [test-and-security, build, deploy]
+    if: always()
+    
+    steps:
+      - name: Deployment Status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ Deployment successful!"
+          else
+            echo "❌ Deployment failed or skipped"
+          fi
